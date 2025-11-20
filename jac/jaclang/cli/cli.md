@@ -37,6 +37,8 @@ Parameters to execute the tool command:
     - `ast`: Displays the Abstract Syntax Tree (AST) of the specified .jac file.
     - `ast.`: Generates a dot graph representation of the AST for the specified .jac file.
     - `cfg.`: Generates a dot graph representatuin of the CFG(Control Flow Graph) for a specific .jac file
+    - `semantic`: Extracts and serializes the Semantic Registry as JSON for the specified .jac file.
+    - `semantic.`: Generates a DOT graph visualization of the Semantic Registry for the specified .jac file.
     - `pyast`: Generates the Python AST for a .py file or the relevant Python AST for the generated Python code from a .jac file.
     - `py`: Displays the relevant generated Python code for the respective Jac code in a .jac file.
   - `file_path`: Path to the .jac or .py file.
@@ -53,6 +55,14 @@ Parameters to execute the tool command:
     >To view the AST tree of a Jac file:
     >```bash
     >$ jac tool ir ast <file_path>
+    >```
+    >To extract the Semantic Registry as JSON:
+    >```bash
+    >$ jac tool ir semantic <file_path>
+    >```
+    >To generate a DOT graph of the Semantic Registry:
+    >```bash
+    >$ jac tool ir semantic. <file_path>
     >```
 
 
