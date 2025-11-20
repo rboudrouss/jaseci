@@ -2,9 +2,10 @@
 
 import ast as py_ast
 import inspect
+import json
 import os
 import sys
-from typing import List, Optional, Type
+from typing import Any, List, Optional, Type
 
 import jaclang.compiler.unitree as uni
 from jaclang.compiler.passes.main import PyastBuildPass
@@ -182,7 +183,7 @@ class AstTool:
         """Generate a AST, SymbolTable tree for .jac file, or Python AST for .py file."""
         error = (
             "Usage: ir <choose one of (sym / sym. / ast / ast. / docir / "
-            "pyast / py / unparse / esast / es)> <.py or .jac file_path>"
+            "pyast / py / unparse / esast / es / semantic / semantic.)> <.py or .jac file_path>"
         )
         if len(args) != 2:
             return error
@@ -219,7 +220,11 @@ class AstTool:
                 except Exception as e:
                     return f"Error While Jac to Py AST conversion: {e}"
             else:
-                ir = prog.compile(file_name, no_cgen=True)
+                # For semantic registry extraction, we need type checking to populate usages
+                if output in ["semantic", "semantic."]:
+                    ir = prog.compile(file_name, no_cgen=True, type_check=True)
+                else:
+                    ir = prog.compile(file_name, no_cgen=True)
 
             match output:
                 case "sym":
@@ -287,6 +292,12 @@ class AstTool:
                         return f"\n{es_to_js(es_ir.gen.es_ast)}"
                     else:
                         return "ECMAScript code generation failed."
+                case "semantic":
+                    # JSON output of semantic registry
+                    return self._serialize_semantic_registry_json(prog, file_name)
+                case "semantic.":
+                    # DOT graph output of semantic registry
+                    return self._serialize_semantic_registry_dot(prog, file_name)
                 case _:
                     return f"Invalid key: {error}"
         else:
@@ -331,3 +342,320 @@ class AstTool:
 
         generate_static_parser(force=True)
         return "Parser generated."
+
+    def semantic(self, args: List[str]) -> str:
+        """Extract and serialize the Semantic Registry for a .jac file or module.
+
+        The Semantic Registry is the symbol table with semantic annotations attached.
+        It's built after AST generation and symbol table construction, including all
+        semantic strings defined via 'sem' statements.
+
+        Args:
+            args: List containing output format and file path
+                  Format can be 'semantic' for JSON or 'semantic.' for DOT graph
+
+        Returns:
+            JSON or DOT representation of the semantic registry
+        """
+        error = (
+            "Usage: semantic <.jac file_path> or semantic. <.jac file_path>\n"
+            "  semantic  - Output semantic registry as JSON\n"
+            "  semantic. - Output semantic registry as DOT graph"
+        )
+        if len(args) != 2:
+            return error
+
+        output, file_name = args
+        prog = JacProgram()
+
+        if not os.path.isfile(file_name):
+            return f"Error: {file_name} not found"
+
+        if not file_name.endswith(".jac"):
+            return "Error: Only .jac files are supported for semantic registry extraction"
+
+        try:
+            # Compile up to the point where semantic registry is complete
+            # This runs: Parse -> SymTabBuild -> DeclImplMatch -> SemanticAnalysis -> SemDefMatch -> TypeCheck
+            # Type checking is needed to populate symbol usages
+            ir = prog.compile(file_name, no_cgen=True, type_check=True)
+
+            if ir.has_syntax_errors:
+                return "Error: File has syntax errors. Cannot extract semantic registry."
+
+            match output:
+                case "semantic":
+                    # JSON output
+                    return self._serialize_semantic_registry_json(prog, file_name)
+                case "semantic.":
+                    # DOT graph output
+                    return self._serialize_semantic_registry_dot(prog, file_name)
+                case _:
+                    return f"Invalid output format: {output}\n{error}"
+
+        except Exception as e:
+            return f"Error while extracting semantic registry: {e}"
+
+    def _serialize_semantic_registry_json(
+        self, prog: JacProgram, target_file: str
+    ) -> str:
+        """Serialize the semantic registry to JSON format.
+
+        Args:
+            prog: The JacProgram containing compiled modules
+            target_file: The target file path to filter symbols
+
+        Returns:
+            JSON string representation of the semantic registry
+        """
+        registry: dict[str, Any] = {
+            "version": "1.0",
+            "modules": {},
+        }
+
+        # Normalize target file path for comparison
+        import os
+
+        target_file_abs = os.path.abspath(target_file)
+
+        # Process all modules in the program hub
+        for mod_path, module in sorted(prog.mod.hub.items()):
+            module_data = self._extract_module_symbols(
+                module.sym_tab, module.name, target_file_abs
+            )
+            # Only include modules that have symbols from the target file
+            if module_data["symbols"] or module_data["sub_scopes"]:
+                registry["modules"][mod_path] = module_data
+
+        # Use json.dumps with sort_keys for deterministic output
+        return json.dumps(registry, indent=2, sort_keys=True)
+
+    def _extract_module_symbols(
+        self, scope: UniScopeNode, scope_name: str, target_file: str
+    ) -> dict[str, Any]:
+        """Recursively extract symbols from a scope.
+
+        Args:
+            scope: The symbol table scope to extract from
+            scope_name: Name of the current scope
+            target_file: The target file path to filter symbols
+
+        Returns:
+            Dictionary containing scope information and symbols
+        """
+        import os
+
+        scope_data: dict[str, Any] = {
+            "scope_name": scope_name,
+            "scope_type": scope.__class__.__name__,
+            "symbols": {},
+            "sub_scopes": {},
+        }
+
+        # Extract symbols in this scope
+        for sym_name, symbol in sorted(scope.names_in_scope.items()):
+            # Skip built-in symbols
+            if sym_name in ["builtins", "__builtins__"]:
+                continue
+
+            # Check if this symbol is defined in the target file
+            is_in_target_file = False
+            if symbol.defn:
+                for defn in symbol.defn:
+                    if os.path.abspath(defn.loc.mod_path) == target_file:
+                        is_in_target_file = True
+                        break
+
+            # Check if this symbol is used in the target file
+            has_usage_in_target = False
+            if symbol.uses:
+                for use in symbol.uses:
+                    if os.path.abspath(use.loc.mod_path) == target_file:
+                        has_usage_in_target = True
+                        break
+
+            # Skip symbols that are neither defined nor used in the target file
+            if not is_in_target_file and not has_usage_in_target:
+                continue
+
+            symbol_data: dict[str, Any] = {
+                "name": symbol.sym_name,
+                "type": str(symbol.sym_type),
+                "access": str(symbol.access),
+                "dotted_name": symbol.sym_dotted_name,
+                "imported": symbol.imported,
+            }
+
+            # Add semantic string if present
+            if symbol.semstr:
+                symbol_data["semantic"] = symbol.semstr
+
+            # Add definitions only from the target file
+            if symbol.defn:
+                target_defns = [
+                    {
+                        "file": defn.loc.mod_path,
+                        "line": defn.loc.first_line,
+                        "column": defn.loc.col_start,
+                        "end_line": defn.loc.last_line,
+                        "end_column": defn.loc.col_end,
+                    }
+                    for defn in symbol.defn
+                    if os.path.abspath(defn.loc.mod_path) == target_file
+                ]
+                if target_defns:
+                    symbol_data["definitions"] = target_defns
+                elif not is_in_target_file:
+                    # This is a builtin/external symbol used in target file
+                    # Just indicate it's external
+                    symbol_data["external"] = True
+
+            # Add usages only from the target file
+            if symbol.uses:
+                target_uses = [
+                    {
+                        "file": use.loc.mod_path,
+                        "line": use.loc.first_line,
+                        "column": use.loc.col_start,
+                        "end_line": use.loc.last_line,
+                        "end_column": use.loc.col_end,
+                    }
+                    for use in symbol.uses
+                    if os.path.abspath(use.loc.mod_path) == target_file
+                ]
+                if target_uses:
+                    symbol_data["usages"] = target_uses
+
+            scope_data["symbols"][sym_name] = symbol_data
+
+        # Recursively process child scopes
+        for kid_scope in scope.kid_scope:
+            if kid_scope.scope_name == "builtins":
+                continue
+            kid_data = self._extract_module_symbols(
+                kid_scope, kid_scope.scope_name, target_file
+            )
+            # Only include child scopes that have relevant symbols
+            if kid_data["symbols"] or kid_data["sub_scopes"]:
+                scope_data["sub_scopes"][kid_scope.scope_name] = kid_data
+
+        return scope_data
+
+    def _serialize_semantic_registry_dot(
+        self, prog: JacProgram, target_file: str
+    ) -> str:
+        """Serialize the semantic registry to DOT graph format.
+
+        Args:
+            prog: The JacProgram containing compiled modules
+            target_file: The target file path to filter symbols
+
+        Returns:
+            DOT graph string representation of the semantic registry
+        """
+        import os
+
+        target_file_abs = os.path.abspath(target_file)
+        dot_lines = ["digraph semantic_registry {"]
+        dot_lines.append('  rankdir=TB;')
+        dot_lines.append('  node [shape=box, style=rounded];')
+        dot_lines.append("")
+
+        node_id_counter = [0]  # Use list to allow mutation in nested function
+        node_ids: dict[int, int] = {}
+
+        def get_node_id(obj: Any) -> int:
+            """Get or create a unique node ID."""
+            obj_id = id(obj)
+            if obj_id not in node_ids:
+                node_ids[obj_id] = node_id_counter[0]
+                node_id_counter[0] += 1
+            return node_ids[obj_id]
+
+        def escape_label(text: str) -> str:
+            """Escape special characters for DOT labels."""
+            return text.replace('"', '\\"').replace("\n", "\\n")
+
+        def add_scope_to_graph(
+            scope: UniScopeNode, parent_id: Optional[int] = None
+        ) -> None:
+            """Recursively add scope and symbols to DOT graph."""
+            scope_id = get_node_id(scope)
+            scope_label = f"{scope.__class__.__name__}\\n{escape_label(scope.scope_name)}"
+
+            # Add scope node
+            dot_lines.append(
+                f'  n{scope_id} [label="{scope_label}", fillcolor=lightblue, style="rounded,filled"];'
+            )
+
+            # Connect to parent if exists
+            if parent_id is not None:
+                dot_lines.append(f"  n{parent_id} -> n{scope_id};")
+
+            # Add symbols in this scope
+            for sym_name, symbol in sorted(scope.names_in_scope.items()):
+                if sym_name in ["builtins", "__builtins__"]:
+                    continue
+
+                # Check if this symbol is relevant to the target file
+                is_in_target_file = False
+                has_usage_in_target = False
+
+                if symbol.defn:
+                    for defn in symbol.defn:
+                        if os.path.abspath(defn.loc.mod_path) == target_file_abs:
+                            is_in_target_file = True
+                            break
+
+                if symbol.uses:
+                    for use in symbol.uses:
+                        if os.path.abspath(use.loc.mod_path) == target_file_abs:
+                            has_usage_in_target = True
+                            break
+
+                # Skip symbols not relevant to target file
+                if not is_in_target_file and not has_usage_in_target:
+                    continue
+
+                sym_id = get_node_id(symbol)
+                sym_label = f"{escape_label(sym_name)}\\n{symbol.sym_type}"
+
+                # Mark external symbols
+                if not is_in_target_file:
+                    sym_label += "\\n(external)"
+
+                # Add semantic string to label if present
+                if symbol.semstr:
+                    # Truncate long semantic strings
+                    sem_preview = (
+                        symbol.semstr[:50] + "..."
+                        if len(symbol.semstr) > 50
+                        else symbol.semstr
+                    )
+                    sym_label += f'\\n"{escape_label(sem_preview)}"'
+
+                # Color based on whether semantic string exists and if external
+                if not is_in_target_file:
+                    fillcolor = "lightgray"  # External symbols
+                elif symbol.semstr:
+                    fillcolor = "lightgreen"  # Has semantic string
+                else:
+                    fillcolor = "white"  # Local symbol without semantic
+
+                dot_lines.append(
+                    f'  n{sym_id} [label="{sym_label}", fillcolor={fillcolor}, style="rounded,filled"];'
+                )
+                dot_lines.append(f"  n{scope_id} -> n{sym_id};")
+
+            # Recursively process child scopes
+            for kid_scope in scope.kid_scope:
+                if kid_scope.scope_name == "builtins":
+                    continue
+                add_scope_to_graph(kid_scope, scope_id)
+
+        # Process all modules
+        for mod_path, module in sorted(prog.mod.hub.items()):
+            add_scope_to_graph(module.sym_tab)
+
+        dot_lines.append("}")
+        return "\n".join(dot_lines)
